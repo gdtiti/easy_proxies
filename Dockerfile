@@ -14,7 +14,8 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=builder /src/easy-proxies /usr/local/bin/easy-proxies
 COPY config.example.yaml /etc/easy-proxies/config.yaml
-EXPOSE 2323 9091
+# Pool mode: 2323, Management: 9091, Multi-port mode: 24000-24100
+EXPOSE 2323 9091 24000-24100
 USER easy
 ENTRYPOINT ["/usr/local/bin/easy-proxies"]
 CMD ["--config", "/etc/easy-proxies/config.yaml"]

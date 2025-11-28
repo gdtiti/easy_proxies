@@ -272,18 +272,22 @@ management:
 # docker-compose.yml
 services:
   easy-proxies:
-    build: .
-    image: easy-proxies:local
+    image: ghcr.io/jasonwong1991/easy_proxies:latest
     container_name: easy-proxies
     restart: unless-stopped
     ports:
+      # Pool 模式入口
       - "2323:2323"
-      - "9090:9090"
-      - "24000-24100:24000-24100"  # 多端口模式
+      # Web 监控面板
+      - "9091:9091"
+      # Multi-port 模式端口范围（根据节点数量调整）
+      - "24000-24100:24000-24100"
     volumes:
       - ./config.yaml:/etc/easy-proxies/config.yaml:ro
       - ./nodes.txt:/etc/easy-proxies/nodes.txt:ro
 ```
+
+> **注意**: 多端口模式需要在 docker-compose.yml 中映射对应的端口范围。如果你有 N 个节点，需要开放 `24000` 到 `24000+N-1` 的端口。端口范围可以根据实际节点数量调整，例如只有 10 个节点可以改为 `24000-24010:24000-24010`。
 
 ## 构建
 
