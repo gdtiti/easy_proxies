@@ -487,7 +487,7 @@ func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Conte
 		_ = conn.Close()
 		duration := time.Since(start)
 		if member.entry != nil {
-			member.entry.RecordSuccess()
+			member.entry.RecordSuccessWithLatency(duration)
 		}
 		return duration, nil
 	}
@@ -537,7 +537,7 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 		_ = conn.Close()
 		duration := time.Since(start)
 		if member.entry != nil {
-			member.entry.RecordSuccess()
+			member.entry.RecordSuccessWithLatency(duration)
 		}
 		return duration, nil
 	}

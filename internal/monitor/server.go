@@ -6,15 +6,35 @@ import (
 	"embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
+
+	"easy_proxies/internal/config"
 )
 
 //go:embed assets/index.html
 var embeddedFS embed.FS
+
+// NodeManager exposes config node CRUD and reload operations.
+type NodeManager interface {
+	ListConfigNodes(ctx context.Context) ([]config.NodeConfig, error)
+	CreateNode(ctx context.Context, node config.NodeConfig) (config.NodeConfig, error)
+	UpdateNode(ctx context.Context, name string, node config.NodeConfig) (config.NodeConfig, error)
+	DeleteNode(ctx context.Context, name string) error
+	TriggerReload(ctx context.Context) error
+}
+
+// Sentinel errors for node operations.
+var (
+	ErrNodeNotFound = errors.New("节点不存在")
+	ErrNodeConflict = errors.New("节点名称或端口已存在")
+	ErrInvalidNode  = errors.New("无效的节点配置")
+)
 
 // SubscriptionRefresher interface for subscription manager.
 type SubscriptionRefresher interface {
@@ -40,6 +60,7 @@ type Server struct {
 	logger       *log.Logger
 	sessionToken string // 简单的 session token，重启后失效
 	subRefresher SubscriptionRefresher
+	nodeMgr      NodeManager
 }
 
 // NewServer constructs a server; it can be nil when disabled.
@@ -61,10 +82,13 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/api/auth", s.handleAuth)
 	mux.HandleFunc("/api/nodes", s.withAuth(s.handleNodes))
+	mux.HandleFunc("/api/nodes/config", s.withAuth(s.handleConfigNodes))
+	mux.HandleFunc("/api/nodes/config/", s.withAuth(s.handleConfigNodeItem))
 	mux.HandleFunc("/api/nodes/", s.withAuth(s.handleNodeAction))
 	mux.HandleFunc("/api/export", s.withAuth(s.handleExport))
 	mux.HandleFunc("/api/subscription/status", s.withAuth(s.handleSubscriptionStatus))
 	mux.HandleFunc("/api/subscription/refresh", s.withAuth(s.handleSubscriptionRefresh))
+	mux.HandleFunc("/api/reload", s.withAuth(s.handleReload))
 	s.srv = &http.Server{Addr: cfg.Listen, Handler: mux}
 	return s
 }
@@ -73,6 +97,13 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 func (s *Server) SetSubscriptionRefresher(sr SubscriptionRefresher) {
 	if s != nil {
 		s.subRefresher = sr
+	}
+}
+
+// SetNodeManager enables config-node CRUD endpoints.
+func (s *Server) SetNodeManager(nm NodeManager) {
+	if s != nil {
+		s.nodeMgr = nm
 	}
 }
 
@@ -347,4 +378,134 @@ func (s *Server) handleSubscriptionRefresh(w http.ResponseWriter, r *http.Reques
 		"message":    "刷新成功",
 		"node_count": status.NodeCount,
 	})
+}
+
+// nodePayload is the JSON request body for node CRUD operations.
+type nodePayload struct {
+	Name     string `json:"name"`
+	URI      string `json:"uri"`
+	Port     uint16 `json:"port"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+func (p nodePayload) toConfig() config.NodeConfig {
+	return config.NodeConfig{
+		Name:     p.Name,
+		URI:      p.URI,
+		Port:     p.Port,
+		Username: p.Username,
+		Password: p.Password,
+	}
+}
+
+// handleConfigNodes handles GET (list) and POST (create) for config nodes.
+func (s *Server) handleConfigNodes(w http.ResponseWriter, r *http.Request) {
+	if !s.ensureNodeManager(w) {
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		nodes, err := s.nodeMgr.ListConfigNodes(r.Context())
+		if err != nil {
+			s.respondNodeError(w, err)
+			return
+		}
+		writeJSON(w, map[string]any{"nodes": nodes})
+	case http.MethodPost:
+		var payload nodePayload
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			writeJSON(w, map[string]any{"error": "请求格式错误"})
+			return
+		}
+		node, err := s.nodeMgr.CreateNode(r.Context(), payload.toConfig())
+		if err != nil {
+			s.respondNodeError(w, err)
+			return
+		}
+		writeJSON(w, map[string]any{"node": node, "message": "节点已添加，请点击重载使配置生效"})
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// handleConfigNodeItem handles PUT (update) and DELETE for a specific config node.
+func (s *Server) handleConfigNodeItem(w http.ResponseWriter, r *http.Request) {
+	if !s.ensureNodeManager(w) {
+		return
+	}
+
+	namePart := strings.TrimPrefix(r.URL.Path, "/api/nodes/config/")
+	nodeName, err := url.PathUnescape(namePart)
+	if err != nil || nodeName == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "节点名称无效"})
+		return
+	}
+
+	switch r.Method {
+	case http.MethodPut:
+		var payload nodePayload
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			writeJSON(w, map[string]any{"error": "请求格式错误"})
+			return
+		}
+		node, err := s.nodeMgr.UpdateNode(r.Context(), nodeName, payload.toConfig())
+		if err != nil {
+			s.respondNodeError(w, err)
+			return
+		}
+		writeJSON(w, map[string]any{"node": node, "message": "节点已更新，请点击重载使配置生效"})
+	case http.MethodDelete:
+		if err := s.nodeMgr.DeleteNode(r.Context(), nodeName); err != nil {
+			s.respondNodeError(w, err)
+			return
+		}
+		writeJSON(w, map[string]any{"message": "节点已删除，请点击重载使配置生效"})
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// handleReload triggers a configuration reload.
+func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.ensureNodeManager(w) {
+		return
+	}
+
+	if err := s.nodeMgr.TriggerReload(r.Context()); err != nil {
+		s.respondNodeError(w, err)
+		return
+	}
+	writeJSON(w, map[string]any{
+		"message": "重载成功，现有连接已被中断",
+	})
+}
+
+func (s *Server) ensureNodeManager(w http.ResponseWriter) bool {
+	if s.nodeMgr == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		writeJSON(w, map[string]any{"error": "节点管理未启用"})
+		return false
+	}
+	return true
+}
+
+func (s *Server) respondNodeError(w http.ResponseWriter, err error) {
+	status := http.StatusInternalServerError
+	switch {
+	case errors.Is(err, ErrNodeNotFound):
+		status = http.StatusNotFound
+	case errors.Is(err, ErrNodeConflict), errors.Is(err, ErrInvalidNode):
+		status = http.StatusBadRequest
+	}
+	w.WriteHeader(status)
+	writeJSON(w, map[string]any{"error": err.Error()})
 }

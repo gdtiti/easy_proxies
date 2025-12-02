@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,6 +18,9 @@ import (
 	"github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/include"
 )
+
+// Ensure Manager implements monitor.NodeManager.
+var _ monitor.NodeManager = (*Manager)(nil)
 
 const (
 	defaultDrainTimeout       = 10 * time.Second
@@ -130,18 +135,22 @@ func (m *Manager) Start(ctx context.Context) error {
 }
 
 // Reload gracefully switches to a new configuration.
+// For multi-port mode, we must stop the old instance first to release ports.
 func (m *Manager) Reload(newCfg *config.Config) error {
 	if newCfg == nil {
 		return errors.New("new config is nil")
 	}
 
-	m.mu.RLock()
+	m.mu.Lock()
 	if m.currentBox == nil {
-		m.mu.RUnlock()
+		m.mu.Unlock()
 		return errors.New("manager not started")
 	}
 	ctx := m.baseCtx
-	m.mu.RUnlock()
+	oldBox := m.currentBox
+	oldCfg := m.cfg
+	m.currentBox = nil // Mark as reloading
+	m.mu.Unlock()
 
 	if ctx == nil {
 		ctx = context.Background()
@@ -149,55 +158,63 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 
 	m.logger.Infof("reloading with %d nodes", len(newCfg.Nodes))
 
-	// Create new box instance (old still serving)
+	// For multi-port mode, we must close old instance first to release ports
+	// This causes a brief interruption but avoids port conflicts
+	if oldBox != nil {
+		m.logger.Infof("stopping old instance to release ports...")
+		if err := oldBox.Close(); err != nil {
+			m.logger.Warnf("error closing old instance: %v", err)
+		}
+		// Give OS time to release ports
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// Create and start new box instance
 	instance, err := m.createBox(ctx, newCfg)
 	if err != nil {
+		// Rollback: try to restart old config
+		m.rollbackToOldConfig(ctx, oldCfg)
 		return fmt.Errorf("create new box: %w", err)
 	}
 	if err := instance.Start(); err != nil {
 		_ = instance.Close()
+		// Rollback: try to restart old config
+		m.rollbackToOldConfig(ctx, oldCfg)
 		return fmt.Errorf("start new box: %w", err)
 	}
 
-	// Save previous settings for rollback
-	prevDrain := m.drainTimeout
-	prevMin := m.minAvailableNodes
 	m.applyConfigSettings(newCfg)
 
-	// Wait for new instance to complete initial health checks
-	// The pool outbound triggers probeAllMembersOnStartup() on Start()
-	// We give it time to complete before switching
-	warmupTimeout := newCfg.SubscriptionRefresh.HealthCheckTimeout
-	if warmupTimeout <= 0 {
-		warmupTimeout = defaultHealthCheckTimeout
-	}
-	m.logger.Infof("waiting %s for new instance warmup", warmupTimeout)
-	time.Sleep(warmupTimeout)
-
-	// Check if we have enough available nodes after warmup
-	available, total := m.availableNodeCount()
-	if available < m.minAvailableNodes {
-		_ = instance.Close()
-		m.drainTimeout = prevDrain
-		m.minAvailableNodes = prevMin
-		return fmt.Errorf("insufficient nodes after warmup: %d/%d available (need >= %d)", available, total, m.minAvailableNodes)
-	}
-	m.logger.Infof("warmup completed: %d/%d nodes available", available, total)
-
-	// Graceful switch
-	if err := m.gracefulSwitch(instance); err != nil {
-		_ = instance.Close()
-		m.drainTimeout = prevDrain
-		m.minAvailableNodes = prevMin
-		return fmt.Errorf("graceful switch failed: %w", err)
-	}
-
 	m.mu.Lock()
+	m.currentBox = instance
 	m.cfg = newCfg
 	m.mu.Unlock()
 
-	m.logger.Infof("reload completed successfully")
+	m.logger.Infof("reload completed successfully with %d nodes", len(newCfg.Nodes))
 	return nil
+}
+
+// rollbackToOldConfig attempts to restart with the previous configuration.
+func (m *Manager) rollbackToOldConfig(ctx context.Context, oldCfg *config.Config) {
+	if oldCfg == nil {
+		return
+	}
+	m.logger.Warnf("attempting rollback to previous config...")
+	instance, err := m.createBox(ctx, oldCfg)
+	if err != nil {
+		m.logger.Errorf("rollback failed to create box: %v", err)
+		return
+	}
+	if err := instance.Start(); err != nil {
+		_ = instance.Close()
+		m.logger.Errorf("rollback failed to start box: %v", err)
+		return
+	}
+	m.mu.Lock()
+	m.currentBox = instance
+	m.cfg = oldCfg
+	m.mu.Unlock()
+	m.logger.Infof("rollback successful")
 }
 
 // Close terminates the active instance and auxiliary components.
@@ -367,6 +384,10 @@ func (m *Manager) ensureMonitor(ctx context.Context) error {
 			serverToStart = monitor.NewServer(m.monitorCfg, monitorMgr, log.Default())
 			m.monitorServer = serverToStart
 		}
+		// Set NodeManager for config CRUD endpoints
+		if m.monitorServer != nil {
+			m.monitorServer.SetNodeManager(m)
+		}
 		if !m.healthCheckStarted {
 			monitorMgr.StartPeriodicHealthCheck(periodicHealthInterval, periodicHealthTimeout)
 			m.healthCheckStarted = true
@@ -423,4 +444,248 @@ func (a monitorLoggerAdapter) Warn(args ...any) {
 	if a.logger != nil {
 		a.logger.Warnf("%s", fmt.Sprint(args...))
 	}
+}
+
+// --- NodeManager interface implementation ---
+
+var errConfigUnavailable = errors.New("config is not initialized")
+
+// ListConfigNodes returns a copy of all configured nodes.
+func (m *Manager) ListConfigNodes(ctx context.Context) ([]config.NodeConfig, error) {
+	_ = ctx
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.cfg == nil {
+		return nil, errConfigUnavailable
+	}
+	return cloneNodes(m.cfg.Nodes), nil
+}
+
+// CreateNode adds a new node to the config and saves it.
+func (m *Manager) CreateNode(ctx context.Context, node config.NodeConfig) (config.NodeConfig, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return config.NodeConfig{}, err
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.cfg == nil {
+		return config.NodeConfig{}, errConfigUnavailable
+	}
+
+	normalized, err := m.prepareNodeLocked(node, "")
+	if err != nil {
+		return config.NodeConfig{}, err
+	}
+
+	m.cfg.Nodes = append(m.cfg.Nodes, normalized)
+	if err := m.cfg.Save(); err != nil {
+		m.cfg.Nodes = m.cfg.Nodes[:len(m.cfg.Nodes)-1]
+		return config.NodeConfig{}, fmt.Errorf("save config: %w", err)
+	}
+	return normalized, nil
+}
+
+// UpdateNode updates an existing node by name and saves the config.
+func (m *Manager) UpdateNode(ctx context.Context, name string, node config.NodeConfig) (config.NodeConfig, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return config.NodeConfig{}, err
+		}
+	}
+
+	name = strings.TrimSpace(name)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.cfg == nil {
+		return config.NodeConfig{}, errConfigUnavailable
+	}
+
+	idx := m.nodeIndexLocked(name)
+	if idx == -1 {
+		return config.NodeConfig{}, monitor.ErrNodeNotFound
+	}
+
+	normalized, err := m.prepareNodeLocked(node, name)
+	if err != nil {
+		return config.NodeConfig{}, err
+	}
+
+	prev := m.cfg.Nodes[idx]
+	m.cfg.Nodes[idx] = normalized
+	if err := m.cfg.Save(); err != nil {
+		m.cfg.Nodes[idx] = prev
+		return config.NodeConfig{}, fmt.Errorf("save config: %w", err)
+	}
+	return normalized, nil
+}
+
+// DeleteNode removes a node by name and saves the config.
+func (m *Manager) DeleteNode(ctx context.Context, name string) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+
+	name = strings.TrimSpace(name)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.cfg == nil {
+		return errConfigUnavailable
+	}
+
+	idx := m.nodeIndexLocked(name)
+	if idx == -1 {
+		return monitor.ErrNodeNotFound
+	}
+
+	backup := cloneNodes(m.cfg.Nodes)
+	m.cfg.Nodes = append(m.cfg.Nodes[:idx], m.cfg.Nodes[idx+1:]...)
+	if err := m.cfg.Save(); err != nil {
+		m.cfg.Nodes = backup
+		return fmt.Errorf("save config: %w", err)
+	}
+	return nil
+}
+
+// TriggerReload reloads the sing-box instance with current config.
+func (m *Manager) TriggerReload(ctx context.Context) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+
+	m.mu.RLock()
+	cfgCopy := m.copyConfigLocked()
+	m.mu.RUnlock()
+
+	if cfgCopy == nil {
+		return errConfigUnavailable
+	}
+	return m.Reload(cfgCopy)
+}
+
+// --- Helper functions ---
+
+func cloneNodes(nodes []config.NodeConfig) []config.NodeConfig {
+	if len(nodes) == 0 {
+		return []config.NodeConfig{} // Return empty slice, not nil, for proper JSON serialization
+	}
+	out := make([]config.NodeConfig, len(nodes))
+	copy(out, nodes)
+	return out
+}
+
+func (m *Manager) copyConfigLocked() *config.Config {
+	if m.cfg == nil {
+		return nil
+	}
+	cloned := *m.cfg
+	cloned.Nodes = cloneNodes(m.cfg.Nodes)
+	cloned.SetFilePath(m.cfg.FilePath())
+	return &cloned
+}
+
+func (m *Manager) nodeIndexLocked(name string) int {
+	for idx, node := range m.cfg.Nodes {
+		if node.Name == name {
+			return idx
+		}
+	}
+	return -1
+}
+
+func (m *Manager) portInUseLocked(port uint16, currentName string) bool {
+	if port == 0 {
+		return false
+	}
+	for _, node := range m.cfg.Nodes {
+		if node.Name == currentName {
+			continue
+		}
+		if node.Port == port {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) nextAvailablePortLocked() uint16 {
+	base := m.cfg.MultiPort.BasePort
+	if base == 0 {
+		base = 24000
+	}
+	used := make(map[uint16]struct{}, len(m.cfg.Nodes))
+	for _, node := range m.cfg.Nodes {
+		if node.Port > 0 {
+			used[node.Port] = struct{}{}
+		}
+	}
+	port := base
+	for i := 0; i < 1<<16; i++ {
+		if _, ok := used[port]; !ok && port != 0 {
+			return port
+		}
+		port++
+		if port == 0 {
+			port = 1
+		}
+	}
+	return base
+}
+
+func (m *Manager) prepareNodeLocked(node config.NodeConfig, currentName string) (config.NodeConfig, error) {
+	node.Name = strings.TrimSpace(node.Name)
+	node.URI = strings.TrimSpace(node.URI)
+
+	if node.URI == "" {
+		return config.NodeConfig{}, fmt.Errorf("%w: URI 不能为空", monitor.ErrInvalidNode)
+	}
+
+	// Extract name from URI fragment (#name) if not provided
+	if node.Name == "" {
+		if currentName != "" {
+			node.Name = currentName
+		} else if idx := strings.LastIndex(node.URI, "#"); idx != -1 && idx < len(node.URI)-1 {
+			// Extract and URL-decode the fragment
+			fragment := node.URI[idx+1:]
+			if decoded, err := url.QueryUnescape(fragment); err == nil && decoded != "" {
+				node.Name = decoded
+			}
+		}
+		// Fallback to auto-generated name
+		if node.Name == "" {
+			node.Name = fmt.Sprintf("node-%d", len(m.cfg.Nodes)+1)
+		}
+	}
+
+	// Check for name conflict (excluding current node when updating)
+	if idx := m.nodeIndexLocked(node.Name); idx != -1 {
+		if currentName == "" || m.cfg.Nodes[idx].Name != currentName {
+			return config.NodeConfig{}, fmt.Errorf("%w: 节点 %s 已存在", monitor.ErrNodeConflict, node.Name)
+		}
+	}
+
+	// Handle multi-port mode specifics
+	if m.cfg.Mode == "multi-port" {
+		if node.Port == 0 {
+			node.Port = m.nextAvailablePortLocked()
+		} else if m.portInUseLocked(node.Port, currentName) {
+			return config.NodeConfig{}, fmt.Errorf("%w: 端口 %d 已被占用", monitor.ErrNodeConflict, node.Port)
+		}
+		if node.Username == "" {
+			node.Username = m.cfg.MultiPort.Username
+			node.Password = m.cfg.MultiPort.Password
+		}
+	}
+
+	return node, nil
 }

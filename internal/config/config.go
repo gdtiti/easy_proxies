@@ -29,6 +29,8 @@ type Config struct {
 	Subscriptions       []string                  `yaml:"subscriptions"` // 订阅链接列表
 	ExternalIP          string                    `yaml:"external_ip"`   // 外部 IP 地址，用于导出时替换 0.0.0.0
 	LogLevel            string                    `yaml:"log_level"`
+
+	filePath string `yaml:"-"` // 配置文件路径，用于保存
 }
 
 // ListenerConfig defines how the HTTP proxy should listen for clients.
@@ -74,11 +76,11 @@ type SubscriptionRefreshConfig struct {
 
 // NodeConfig describes a single upstream proxy endpoint expressed as URI.
 type NodeConfig struct {
-	Name     string `yaml:"name"`
-	URI      string `yaml:"uri"`
-	Port     uint16 `yaml:"port,omitempty"`
-	Username string `yaml:"username,omitempty"`
-	Password string `yaml:"password,omitempty"`
+	Name     string `yaml:"name" json:"name"`
+	URI      string `yaml:"uri" json:"uri"`
+	Port     uint16 `yaml:"port,omitempty" json:"port,omitempty"`
+	Username string `yaml:"username,omitempty" json:"username,omitempty"`
+	Password string `yaml:"password,omitempty" json:"password,omitempty"`
 }
 
 // Load reads YAML config from disk and applies defaults/validation.
@@ -91,6 +93,7 @@ func Load(path string) (*Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("decode config: %w", err)
 	}
+	cfg.filePath = path
 
 	// Resolve nodes_file path relative to config file directory
 	if cfg.NodesFile != "" && !filepath.IsAbs(cfg.NodesFile) {
@@ -597,4 +600,47 @@ func buildHysteria2URI(p clashProxy) string {
 	}
 
 	return fmt.Sprintf("hysteria2://%s@%s:%d%s#%s", p.Password, p.Server, p.Port, query, url.QueryEscape(p.Name))
+}
+
+// FilePath returns the config file path.
+func (c *Config) FilePath() string {
+	if c == nil {
+		return ""
+	}
+	return c.filePath
+}
+
+// SetFilePath sets the config file path (used when creating config programmatically).
+func (c *Config) SetFilePath(path string) {
+	if c != nil {
+		c.filePath = path
+	}
+}
+
+// Save persists the current config back to its source YAML file.
+// Note: When saving, nodes_file and subscriptions are cleared to prevent
+// duplicate nodes on next load (since their nodes are already in the Nodes slice).
+func (c *Config) Save() error {
+	if c == nil {
+		return errors.New("config is nil")
+	}
+	if c.filePath == "" {
+		return errors.New("config file path is unknown")
+	}
+
+	// Create a copy for saving to avoid modifying the running config
+	saveCfg := *c
+	// Clear external sources to prevent duplicate nodes on reload
+	// The nodes from these sources are already in saveCfg.Nodes
+	saveCfg.NodesFile = ""
+	saveCfg.Subscriptions = nil
+
+	data, err := yaml.Marshal(&saveCfg)
+	if err != nil {
+		return fmt.Errorf("encode config: %w", err)
+	}
+	if err := os.WriteFile(c.filePath, data, 0o644); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+	return nil
 }
