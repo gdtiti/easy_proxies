@@ -491,14 +491,48 @@ func (s *Server) handleExportHealthy(w http.ResponseWriter, r *http.Request) {
 	snapshots := s.mgr.SnapshotFiltered(false) // 获取所有节点
 	var lines []string
 
+	// 调试：记录节点总数
+	s.logger.Printf("DEBUG: 导出健康节点 - 总节点数: %d", len(snapshots))
+
+	// 调试：分类统计
+	var checkedAvailable, checkedUnavailable, unchecked, withAddress int
 	for _, snap := range snapshots {
-		// 只导出当前真正健康的节点：已完成检查且可用且有监听地址和端口
-		if !snap.InitialCheckDone || !snap.Available || snap.ListenAddress == "" || snap.Port == 0 {
+		if snap.InitialCheckDone {
+			if snap.Available {
+				checkedAvailable++
+				if snap.ListenAddress != "" && snap.Port != 0 {
+					withAddress++
+				}
+			} else {
+				checkedUnavailable++
+			}
+		} else {
+			unchecked++
+		}
+	}
+	s.logger.Printf("DEBUG: 节点状态统计 - 已检查可用:%d, 已检查不可用:%d, 未检查:%d, 有地址端口:%d",
+		checkedAvailable, checkedUnavailable, unchecked, withAddress)
+
+	for _, snap := range snapshots {
+		// 调试：记录每个节点的状态
+		s.logger.Printf("DEBUG: 节点 %s - InitialCheckDone:%v, Available:%v, ListenAddress:%s, Port:%d",
+			snap.Name, snap.InitialCheckDone, snap.Available, snap.ListenAddress, snap.Port)
+
+		// 只导出当前真正健康的节点：已完成检查且可用
+		if !snap.InitialCheckDone || !snap.Available {
+			s.logger.Printf("DEBUG: 跳过节点 %s - 原因: InitialCheckDone:%v, Available:%v",
+				snap.Name, snap.InitialCheckDone, snap.Available)
 			continue
 		}
 
-		// 在 hybrid 和 multi-port 模式下，导出每节点独立端口
-		// 在 pool 模式下，所有节点共享同一端口，也正常导出
+		// 对于混合模式，优先使用节点的独立监听地址和端口
+		// 如果没有，则跳过（让现有导出逻辑处理）
+		if snap.ListenAddress == "" || snap.Port == 0 {
+			s.logger.Printf("DEBUG: 跳过节点 %s - 没有监听地址或端口", snap.Name)
+			continue
+		}
+
+		// 使用节点的独立监听地址和端口
 		listenAddr := snap.ListenAddress
 		if listenAddr == "0.0.0.0" || listenAddr == "::" {
 			if extIP, _ := s.getSettings(); extIP != "" {
@@ -515,7 +549,10 @@ func (s *Server) handleExportHealthy(w http.ResponseWriter, r *http.Request) {
 			proxyURI = fmt.Sprintf("http://%s:%d", listenAddr, snap.Port)
 		}
 		lines = append(lines, proxyURI)
+		s.logger.Printf("DEBUG: 导出节点 %s: %s", snap.Name, proxyURI)
 	}
+
+	s.logger.Printf("DEBUG: 最终导出 %d 个健康节点", len(lines))
 
 	// 返回纯文本，每行一个 URI
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -539,8 +576,15 @@ func (s *Server) handleCleanupUnhealthy(w http.ResponseWriter, r *http.Request) 
 	var unhealthyNodes []string
 	var checkedNodes, availableNodes, uncheckedNodes int
 
+	// 调试：记录节点总数
+	s.logger.Printf("DEBUG: 删除不健康节点 - 总节点数: %d", len(snapshots))
+
 	// 识别不健康的节点
 	for _, snap := range snapshots {
+		// 调试：记录每个节点的状态
+		s.logger.Printf("DEBUG: 检查节点 %s - InitialCheckDone:%v, Available:%v, ListenAddress:%s, Port:%d",
+			snap.Name, snap.InitialCheckDone, snap.Available, snap.ListenAddress, snap.Port)
+
 		if snap.InitialCheckDone {
 			checkedNodes++
 			if snap.Available {
@@ -548,11 +592,15 @@ func (s *Server) handleCleanupUnhealthy(w http.ResponseWriter, r *http.Request) 
 			} else {
 				// 如果节点已完成检查但不可用，则视为不健康
 				unhealthyNodes = append(unhealthyNodes, snap.Name)
+				s.logger.Printf("DEBUG: 发现不健康节点: %s", snap.Name)
 			}
 		} else {
 			uncheckedNodes++
 		}
 	}
+
+	s.logger.Printf("DEBUG: 节点统计 - 总数:%d, 已检查:%d, 可用:%d, 不健康:%d, 未检查:%d",
+		len(snapshots), checkedNodes, availableNodes, len(unhealthyNodes), uncheckedNodes)
 
 	// 如果没有不健康的节点
 	if len(unhealthyNodes) == 0 {
