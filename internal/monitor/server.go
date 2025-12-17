@@ -91,6 +91,7 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	mux.HandleFunc("/api/nodes/config/", s.withAuth(s.handleConfigNodeItem))
 	mux.HandleFunc("/api/nodes/probe-all", s.withAuth(s.handleProbeAll))
 	mux.HandleFunc("/api/nodes/", s.withAuth(s.handleNodeAction))
+	mux.HandleFunc("/api/nodes/cleanup-unhealthy", s.withAuth(s.handleCleanupUnhealthy))
 	mux.HandleFunc("/api/export", s.withAuth(s.handleExport))
 	mux.HandleFunc("/api/export-healthy", s.withAuth(s.handleExportHealthy))
 	mux.HandleFunc("/api/subscription/status", s.withAuth(s.handleSubscriptionStatus))
@@ -520,6 +521,63 @@ func (s *Server) handleExportHealthy(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Disposition", "attachment; filename=healthy_proxies.txt")
 	_, _ = w.Write([]byte(strings.Join(lines, "\n")))
+}
+
+// handleCleanupUnhealthy 删除所有不健康的节点并保存配置
+func (s *Server) handleCleanupUnhealthy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	if !s.ensureNodeManager(w) {
+		return
+	}
+
+	// 获取所有节点状态
+	snapshots := s.mgr.SnapshotFiltered(false) // 获取所有节点，包括不健康的
+	var unhealthyNodes []string
+
+	// 识别不健康的节点
+	for _, snap := range snapshots {
+		// 如果节点已完成检查但不可用，则视为不健康
+		if snap.InitialCheckDone && !snap.Available {
+			unhealthyNodes = append(unhealthyNodes, snap.Name)
+		}
+	}
+
+	// 如果没有不健康的节点
+	if len(unhealthyNodes) == 0 {
+		writeJSON(w, map[string]any{
+			"message": "没有发现不健康的节点",
+			"deleted": 0,
+		})
+		return
+	}
+
+	// 删除不健康的节点
+	deletedCount := 0
+	for _, nodeName := range unhealthyNodes {
+		if err := s.nodeMgr.DeleteNode(r.Context(), nodeName); err != nil {
+			// 记录删除失败的节点，但继续删除其他节点
+			s.logger.Printf("删除节点 %s 失败: %v", nodeName, err)
+			continue
+		}
+		deletedCount++
+	}
+
+	// 返回删除结果
+	message := fmt.Sprintf("已删除 %d 个不健康节点，请点击重载使配置生效", deletedCount)
+	if deletedCount < len(unhealthyNodes) {
+		message = fmt.Sprintf("已删除 %d 个不健康节点（共 %d 个），部分节点删除失败，请点击重载使配置生效",
+			deletedCount, len(unhealthyNodes))
+	}
+
+	writeJSON(w, map[string]any{
+		"message": message,
+		"deleted": deletedCount,
+		"total":   len(unhealthyNodes),
+	})
 }
 
 // handleSettings handles GET/PUT for dynamic settings (external_ip, probe_target).
