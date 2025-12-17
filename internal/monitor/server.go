@@ -487,13 +487,13 @@ func (s *Server) handleExportHealthy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 只导出当前健康的节点（Available=true）
-	snapshots := s.mgr.SnapshotFiltered(true)
+	// 获取所有节点状态，不进行过滤，然后手动筛选健康节点
+	snapshots := s.mgr.SnapshotFiltered(false) // 获取所有节点
 	var lines []string
 
 	for _, snap := range snapshots {
-		// 只导出当前健康且有监听地址和端口的节点
-		if !snap.Available || snap.ListenAddress == "" || snap.Port == 0 {
+		// 只导出当前真正健康的节点：已完成检查且可用且有监听地址和端口
+		if !snap.InitialCheckDone || !snap.Available || snap.ListenAddress == "" || snap.Port == 0 {
 			continue
 		}
 
@@ -537,20 +537,32 @@ func (s *Server) handleCleanupUnhealthy(w http.ResponseWriter, r *http.Request) 
 	// 获取所有节点状态
 	snapshots := s.mgr.SnapshotFiltered(false) // 获取所有节点，包括不健康的
 	var unhealthyNodes []string
+	var checkedNodes, availableNodes, uncheckedNodes int
 
 	// 识别不健康的节点
 	for _, snap := range snapshots {
-		// 如果节点已完成检查但不可用，则视为不健康
-		if snap.InitialCheckDone && !snap.Available {
-			unhealthyNodes = append(unhealthyNodes, snap.Name)
+		if snap.InitialCheckDone {
+			checkedNodes++
+			if snap.Available {
+				availableNodes++
+			} else {
+				// 如果节点已完成检查但不可用，则视为不健康
+				unhealthyNodes = append(unhealthyNodes, snap.Name)
+			}
+		} else {
+			uncheckedNodes++
 		}
 	}
 
 	// 如果没有不健康的节点
 	if len(unhealthyNodes) == 0 {
 		writeJSON(w, map[string]any{
-			"message": "没有发现不健康的节点",
-			"deleted": 0,
+			"message":       "没有发现不健康的节点",
+			"deleted":       0,
+			"total_nodes":   len(snapshots),
+			"checked_nodes": checkedNodes,
+			"available_nodes": availableNodes,
+			"unchecked_nodes": uncheckedNodes,
 		})
 		return
 	}
@@ -574,9 +586,13 @@ func (s *Server) handleCleanupUnhealthy(w http.ResponseWriter, r *http.Request) 
 	}
 
 	writeJSON(w, map[string]any{
-		"message": message,
-		"deleted": deletedCount,
-		"total":   len(unhealthyNodes),
+		"message":         message,
+		"deleted":         deletedCount,
+		"total":           len(unhealthyNodes),
+		"total_nodes":     len(snapshots),
+		"checked_nodes":   checkedNodes,
+		"available_nodes": availableNodes,
+		"unchecked_nodes": uncheckedNodes,
 	})
 }
 

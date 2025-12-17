@@ -1234,7 +1234,9 @@
             }
           }, 1000);
         } else {
-          showToast(result.message, 'info');
+          // 显示详细的节点状态信息
+          const details = `\n\n节点状态统计：\n总节点数：${result.total_nodes || 0}\n已检查：${result.checked_nodes || 0}\n可用节点：${result.available_nodes || 0}\n未检查：${result.unchecked_nodes || 0}`;
+          showToast(result.message + details, 'info');
         }
       } catch (err) {
         showToast('删除不健康节点失败: ' + err.message, 'error');
