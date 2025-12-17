@@ -92,6 +92,7 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	mux.HandleFunc("/api/nodes/probe-all", s.withAuth(s.handleProbeAll))
 	mux.HandleFunc("/api/nodes/", s.withAuth(s.handleNodeAction))
 	mux.HandleFunc("/api/export", s.withAuth(s.handleExport))
+	mux.HandleFunc("/api/export-healthy", s.withAuth(s.handleExportHealthy))
 	mux.HandleFunc("/api/subscription/status", s.withAuth(s.handleSubscriptionStatus))
 	mux.HandleFunc("/api/subscription/refresh", s.withAuth(s.handleSubscriptionRefresh))
 	mux.HandleFunc("/api/reload", s.withAuth(s.handleReload))
@@ -474,6 +475,50 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	// 返回纯文本，每行一个 URI
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Disposition", "attachment; filename=proxy_pool.txt")
+	_, _ = w.Write([]byte(strings.Join(lines, "\n")))
+}
+
+// handleExportHealthy 导出所有健康代理池节点的 HTTP 代理 URI，每行一个
+// 只导出当前状态为健康的节点（Available=true）
+func (s *Server) handleExportHealthy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	// 只导出当前健康的节点（Available=true）
+	snapshots := s.mgr.SnapshotFiltered(true)
+	var lines []string
+
+	for _, snap := range snapshots {
+		// 只导出当前健康且有监听地址和端口的节点
+		if !snap.Available || snap.ListenAddress == "" || snap.Port == 0 {
+			continue
+		}
+
+		// 在 hybrid 和 multi-port 模式下，导出每节点独立端口
+		// 在 pool 模式下，所有节点共享同一端口，也正常导出
+		listenAddr := snap.ListenAddress
+		if listenAddr == "0.0.0.0" || listenAddr == "::" {
+			if extIP, _ := s.getSettings(); extIP != "" {
+				listenAddr = extIP
+			}
+		}
+
+		var proxyURI string
+		if s.cfg.ProxyUsername != "" && s.cfg.ProxyPassword != "" {
+			proxyURI = fmt.Sprintf("http://%s:%s@%s:%d",
+				s.cfg.ProxyUsername, s.cfg.ProxyPassword,
+				listenAddr, snap.Port)
+		} else {
+			proxyURI = fmt.Sprintf("http://%s:%d", listenAddr, snap.Port)
+		}
+		lines = append(lines, proxyURI)
+	}
+
+	// 返回纯文本，每行一个 URI
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Disposition", "attachment; filename=healthy_proxies.txt")
 	_, _ = w.Write([]byte(strings.Join(lines, "\n")))
 }
 
