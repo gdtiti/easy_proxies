@@ -187,6 +187,20 @@ type BatchImportResponse struct {
         <div class="group-nodes">
             <div class="nodes-header">
                 <h4>节点列表</h4>
+                <div class="nodes-stats">
+                    <span class="stat-item">
+                        <span class="stat-label">总计:</span>
+                        <span class="stat-value" id="totalNodes">0</span>
+                    </span>
+                    <span class="stat-item">
+                        <span class="stat-label">可用:</span>
+                        <span class="stat-value healthy" id="availableNodes">0</span>
+                    </span>
+                    <span class="stat-item">
+                        <span class="stat-label">不可用:</span>
+                        <span class="stat-value unhealthy" id="unhealthyNodes">0</span>
+                    </span>
+                </div>
                 <div class="nodes-actions">
                     <button class="btn btn-secondary" onclick="showImportModal()">
                         <svg>...</svg>
@@ -196,14 +210,41 @@ type BatchImportResponse struct {
                         <svg>...</svg>
                         探测全部
                     </button>
-                    <button class="btn btn-secondary" onclick="exportGroupNodes()">
+                    <button class="btn btn-secondary" onclick="cleanupGroupUnhealthy()">
                         <svg>...</svg>
-                        导出节点
+                        清除不健康节点
                     </button>
+                    <div class="btn-group">
+                        <button class="btn btn-secondary" onclick="exportGroupNodes()">
+                            <svg>...</svg>
+                            导出节点
+                        </button>
+                        <button class="btn btn-success" onclick="exportGroupHealthyNodes()">
+                            <svg>...</svg>
+                            导出健康节点
+                        </button>
+                    </div>
                 </div>
             </div>
             <div class="nodes-table" id="nodesTable">
                 <!-- 节点表格 -->
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>节点名称</th>
+                            <th>类型</th>
+                            <th>地址</th>
+                            <th>端口</th>
+                            <th>状态</th>
+                            <th>延迟</th>
+                            <th>最后检查</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="nodesTableBody">
+                        <!-- 动态生成节点行 -->
+                    </tbody>
+                </table>
             </div>
         </div>
     </div>
@@ -403,6 +444,21 @@ func (gm *GroupManager) GetGroupStatus(groupID string) (*GroupStatus, error)
 
 // 批量导入节点
 func (gm *GroupManager) BatchImport(groupID string, request BatchImportRequest) (*BatchImportResponse, error)
+
+// 分组节点管理方法
+func (gm *GroupManager) GetGroupNodes(groupID string) ([]monitor.Snapshot, error)
+
+func (gm *GroupManager) ProbeGroupNode(groupID, nodeID string) (time.Duration, error)
+
+func (gm *GroupManager) ProbeGroupAllNodes(groupID string, ctx context.Context) (<-chan monitor.ProbeResult, error)
+
+func (gm *GroupManager) CleanupGroupUnhealthy(groupID string) (*CleanupResponse, error)
+
+func (gm *GroupManager) ExportGroupNodes(groupID string) (string, error)
+
+func (gm *GroupManager) ExportGroupHealthyNodes(groupID string) (string, error)
+
+func (gm *GroupManager) ReleaseGroupNode(groupID, nodeID string) error
 ```
 
 ### 2. 端口分配管理
@@ -562,6 +618,242 @@ function createGroupItem(group) {
     div.onclick = () => selectGroup(group.id);
     return div;
 }
+
+// 分组节点管理方法
+class GroupNodeManager {
+    constructor(groupId) {
+        this.groupId = groupId;
+    }
+
+    // 获取分组节点列表
+    async getNodes() {
+        const response = await fetch(`/api/groups/${this.groupId}/nodes`);
+        return await response.json();
+    }
+
+    // 探测单个节点
+    async probeNode(nodeId) {
+        const response = await fetch(`/api/groups/${this.groupId}/nodes/${nodeId}/probe`, {
+            method: 'POST'
+        });
+        return await response.json();
+    }
+
+    // 批量探测所有节点 (SSE流)
+    async probeAllNodes(onProgress) {
+        const response = await fetch(`/api/groups/${this.groupId}/nodes/probe-all`, {
+            method: 'POST'
+        });
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            const lines = decoder.decode(value, { stream: true }).split('\n');
+            for (const line of lines) {
+                if (line.trim()) {
+                    const result = JSON.parse(line);
+                    onProgress(result);
+                }
+            }
+        }
+    }
+
+    // 清除不健康节点
+    async cleanupUnhealthy() {
+        const response = await fetch(`/api/groups/${this.groupId}/nodes/cleanup-unhealthy`, {
+            method: 'POST'
+        });
+        return await response.json();
+    }
+
+    // 导出所有节点
+    async exportNodes() {
+        const response = await fetch(`/api/groups/${this.groupId}/nodes/export`);
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `group_${this.groupId}_nodes.txt`;
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        document.body.removeChild(a);
+    }
+
+    // 导出健康节点
+    async exportHealthyNodes() {
+        const response = await fetch(`/api/groups/${this.groupId}/nodes/export-healthy`);
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `group_${this.groupId}_healthy_nodes.txt`;
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        document.body.removeChild(a);
+    }
+
+    // 释放节点拉黑状态
+    async releaseNode(nodeId) {
+        const response = await fetch(`/api/groups/${this.groupId}/nodes/${nodeId}/release`, {
+            method: 'POST'
+        });
+        return await response.json();
+    }
+}
+
+// 全局分组节点管理器实例
+let currentNodeManager = null;
+
+// 初始化分组节点管理
+function initGroupNodeManager(groupId) {
+    currentNodeManager = new GroupNodeManager(groupId);
+}
+
+// 分组节点操作函数
+function probeGroupNodes() {
+    if (!currentNodeManager) {
+        showToast('请先选择分组', 'error');
+        return;
+    }
+
+    showToast('开始探测分组节点...', 'info');
+
+    currentNodeManager.probeAllNodes((result) => {
+        if (result.error) {
+            showToast(`探测失败: ${result.error}`, 'error');
+        } else {
+            showToast(`节点 ${result.node} 探测完成，延迟: ${result.latency_ms}ms`, 'success');
+        }
+        // 更新节点状态显示
+        refreshGroupNodes();
+    });
+}
+
+function cleanupGroupUnhealthy() {
+    if (!currentNodeManager) {
+        showToast('请先选择分组', 'error');
+        return;
+    }
+
+    if (!confirm('确定要清除该分组中的所有不健康节点吗？\n\n这将删除已完成检查但不可用的节点。')) {
+        return;
+    }
+
+    currentNodeManager.cleanupUnhealthy().then(result => {
+        if (result.deleted > 0) {
+            showToast(`已清除 ${result.deleted} 个不健康节点`, 'success');
+            // 询问是否重载配置
+            setTimeout(() => {
+                if (confirm('是否重载分组配置以使更改生效？')) {
+                    reloadGroupConfig();
+                }
+            }, 1000);
+        } else {
+            const details = `\n\n节点状态统计：\n总节点数：${result.total_nodes || 0}\n已检查：${result.checked_nodes || 0}\n可用节点：${result.available_nodes || 0}\n未检查：${result.unchecked_nodes || 0}`;
+            showToast('没有发现不健康节点' + details, 'info');
+        }
+        refreshGroupNodes();
+    }).catch(err => {
+        showToast('清除失败: ' + err.message, 'error');
+    });
+}
+
+function exportGroupNodes() {
+    if (!currentNodeManager) {
+        showToast('请先选择分组', 'error');
+        return;
+    }
+
+    currentNodeManager.exportNodes();
+    showToast('分组节点导出完成', 'success');
+}
+
+function exportGroupHealthyNodes() {
+    if (!currentNodeManager) {
+        showToast('请先选择分组', 'error');
+        return;
+    }
+
+    currentNodeManager.exportHealthyNodes();
+    showToast('分组健康节点导出完成', 'success');
+}
+
+function probeNode(nodeId) {
+    if (!currentNodeManager) {
+        showToast('请先选择分组', 'error');
+        return;
+    }
+
+    currentNodeManager.probeNode(nodeId).then(result => {
+        if (result.error) {
+            showToast(`探测失败: ${result.error}`, 'error');
+        } else {
+            showToast(`探测成功，延迟: ${result.latency_ms}ms`, 'success');
+        }
+        refreshGroupNodes();
+    }).catch(err => {
+        showToast('探测失败: ' + err.message, 'error');
+    });
+}
+
+function releaseNode(nodeId) {
+    if (!currentNodeManager) {
+        showToast('请先选择分组', 'error');
+        return;
+    }
+
+    currentNodeManager.releaseNode(nodeId).then(result => {
+        showToast('已解除节点拉黑状态', 'success');
+        refreshGroupNodes();
+    }).catch(err => {
+        showToast('释放失败: ' + err.message, 'error');
+    });
+}
+
+// 渲染分组节点表格
+function renderGroupNodesTable(nodes) {
+    const tbody = document.getElementById('nodesTableBody');
+    tbody.innerHTML = '';
+
+    nodes.forEach(node => {
+        const row = createNodeRow(node);
+        tbody.appendChild(row);
+    });
+
+    // 更新统计信息
+    document.getElementById('totalNodes').textContent = nodes.length;
+    document.getElementById('availableNodes').textContent = nodes.filter(n => n.available).length;
+    document.getElementById('unhealthyNodes').textContent = nodes.filter(n => n.initial_check_done && !n.available).length;
+}
+
+function createNodeRow(node) {
+    const row = document.createElement('tr');
+    const statusClass = node.available ? 'healthy' : (node.initial_check_done ? 'unhealthy' : 'unknown');
+    const statusText = node.available ? '可用' : (node.initial_check_done ? '不可用' : '未检查');
+
+    row.innerHTML = `
+        <td>${node.name}</td>
+        <td>${node.mode}</td>
+        <td>${node.listen_address || '-'}</td>
+        <td>${node.port || '-'}</td>
+        <td><span class="status ${statusClass}">${statusText}</span></td>
+        <td>${node.last_latency_ms >= 0 ? node.last_latency_ms + 'ms' : '-'}</td>
+        <td>${formatTime(node.last_success || node.last_failure)}</td>
+        <td>
+            <button onclick="probeNode('${node.tag}')" class="btn btn-sm">探测</button>
+            ${node.blacklisted ? `<button onclick="releaseNode('${node.tag}')" class="btn btn-sm btn-warning">释放</button>` : ''}
+        </td>
+    `;
+    return row;
+}
 ```
 
 ### 2. 批量导入
@@ -636,7 +928,29 @@ function showImportResult(result) {
 
 ## 兼容性处理
 
-### 1. 配置文件兼容
+### 1. 保持全局功能兼容
+
+现有的全局功能将继续正常工作，与新的分组功能并存：
+
+**全局API端点（保持不变）**：
+```go
+// 现有的全局节点管理API
+GET    /api/nodes                    // 获取所有节点（全局视图）
+POST   /api/nodes/probe-all          // 批量探测所有节点
+POST   /api/nodes/cleanup-unhealthy  // 清除全局不健康节点
+GET    /api/export                    // 导出全局所有节点
+GET    /api/export-healthy            // 导出全局健康节点
+GET    /api/nodes/{tag}/probe         // 探测单个节点
+POST   /api/nodes/{tag}/release       // 释放节点拉黑状态
+```
+
+**全局与分组功能的关系**：
+- **全局功能**：管理所有节点的统一视图和操作
+- **分组功能**：按业务需求管理特定分组节点
+- **数据隔离**：每个分组有独立的配置和管理范围
+- **操作隔离**：分组操作不影响其他分组或全局节点
+
+### 2. 配置文件兼容
 
 ```go
 // ConfigV2 新的配置结构
@@ -723,11 +1037,36 @@ func MigrateConfig(oldConfig *config.Config) *ConfigV2 {
 
 这个分组管理功能设计提供了：
 
-1. **完整的分组管理**：创建、编辑、删除、启停分组
-2. **灵活的配置选项**：每个分组独立的端口、测试URL、认证配置
-3. **便捷的节点管理**：支持多种导入方式和格式
-4. **良好的用户体验**：直观的前端界面和操作流程
-5. **向后兼容性**：现有配置和API继续工作
-6. **可扩展架构**：便于后续功能扩展
+### 🎯 **核心分组功能**
+1. **��整的分组管理**：创建、编辑、删除、启停分组
+2. **独立的分组配置**：每个分组独立的端口、测试URL、认证配置
+3. **批量节点管理**：支持多种导入方式和格式
+4. **分组隔离运行**：每个分组独立的运行环境和管理范围
+
+### 🔧 **分组节点管理功能**
+1. **独立检测**：每个分组独立的健康检测机制和测试URL
+2. **独立清理**：每个分组独立的"清除不健康节点"功能
+3. **独立导出**：每个分组独立的"导出节点"和"导出健康节点"功能
+4. **实时统计**：每个分组独立的节点状态统计和监控
+
+### 🔄 **全局功能保持**
+1. **现有API完全兼容**：所有现有的 `/api/nodes/*` 和 `/api/export*` 端点保持不变
+2. **现有功能继续工作**：全局的检测、清除、导出功能继续正常工作
+3. **数据视图共存**：用户可以同时使用全局视图和分组视图
+4. **操作互不影响**：分组操作不影响全局节点，全局操作不影响分组内部管理
+
+### 🎨 **用户体验优化**
+1. **直观的分组界面**：清晰的分组管理和节点管理界面
+2. **一致的操作体验**：分组内操作与全局操作保持一致的交互模式
+3. **详细的状态反馈**：每个分组独立的操作状态和进度提示
+4. **灵活的管理模式**：支持全局管理和分组管理两种模式
+
+### 🏗️ **技术架构优势**
+1. **向后兼容性**：现有配置和API继续工作，无需迁移
+2. **可扩展架构**：便于后续功能扩展和性能优化
+3. **数据隔离**：每个分组独立的配置和状态管理
+4. **操作安全**：分组操作有完整的权限控制和错误处理
+
+该方案不仅提供了强大的分组管理能力，还完全保持了现有功能的稳定性，为用户提供了更灵活和强大的代理节点管理选择。
 
 该方案保持了与现有代码的一致性，同时提供了强大的分组管理能力。
